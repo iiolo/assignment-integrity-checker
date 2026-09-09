@@ -7,24 +7,24 @@ from sklearn.metrics.pairwise import cosine_similarity
 def calculate_similarities(
     student_texts: dict[str, str], threshold: float = 40.0
 ) -> list[tuple[str, str, float]]:
-    """학생별 텍스트를 서로 비교해서 유사도가 threshold(%) 이상인 쌍만 반환한다."""
+    """Compare every pair of students' texts and return pairs with similarity >= threshold(%)."""
     students = list(student_texts.keys())
 
-    # 비교할 학생이 2명 미만이면 계산할 필요가 없음
+    # No comparison needed with fewer than 2 students
     if len(students) < 2:
         return []
 
-    # TF-IDF로 모든 학생의 텍스트를 벡터화
+    # Vectorize all students' texts using TF-IDF
     texts = [student_texts[name] for name in students]
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform(texts)
 
-    # 모든 문서 쌍 간의 코사인 유사도 행렬 계산
+    # Compute the cosine similarity matrix between all document pairs
     similarity_matrix = cosine_similarity(tfidf_matrix)
 
     results: list[tuple[str, str, float]] = []
 
-    # 중복 없이 모든 학생 쌍(A-B)을 순회하며 임계값 이상인 쌍만 결과에 추가
+    # Iterate over every unique student pair (A-B) and keep only pairs at or above the threshold
     for i, j in combinations(range(len(students)), 2):
         score = similarity_matrix[i][j] * 100
         if score >= threshold:

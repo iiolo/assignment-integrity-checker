@@ -4,9 +4,9 @@ import tempfile
 
 import streamlit as st
 
-from ai_detection_check import check_ai_generated
-from extract_text import extract_text
-from similarity import calculate_similarities
+from src.ai_detection_check import check_ai_generated
+from src.extract_text import extract_text
+from src.similarity import calculate_similarities
 
 st.set_page_config(page_title="Assignment Integrity Checker", layout="wide")
 st.title("Assignment Integrity Checker")

@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+python-docx==1.2.0
+pypdf==6.18.0
+scikit-learn==1.9.0
+requests==2.34.2
+python-dotenv==1.2.3
+pip_system_certs==5.3
+transformers==5.16.1
+torch==2.14.0+cpu
+msal==1.38.0
+streamlit==1.63.0

@@ -10,7 +10,7 @@ load_dotenv()
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 TENANT_ID = os.getenv("AZURE_TENANT_ID")
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPES = ["EduAssignments.ReadBasic", "User.Read"]
+SCOPES = ["EduAssignments.ReadBasic", "EduRoster.ReadBasic", "Files.Read.All", "User.Read"]
 
 # Cache file keeps the signed-in session so teachers don't log in every run
 TOKEN_CACHE_PATH = os.path.join(os.path.dirname(__file__), "token_cache.bin")

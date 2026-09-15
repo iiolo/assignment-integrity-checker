@@ -34,6 +34,12 @@ def get_assignments(token: str, class_id: str) -> list[dict]:
     ]
 
 
+def get_class_members(token: str, class_id: str) -> list[dict]:
+    """Return the roster of a class (teachers and students), including display names."""
+    data = _get(f"{GRAPH_BASE}/education/classes/{class_id}/members", token)
+    return [{"id": m["id"], "displayName": m.get("displayName")} for m in data.get("value", [])]
+
+
 def get_submissions(token: str, class_id: str, assignment_id: str) -> list[dict]:
     """Return student submissions for a given assignment."""
     data = _get(

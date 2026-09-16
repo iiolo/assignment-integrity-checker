@@ -71,6 +71,12 @@ def render_report(student_texts: dict[str, str], threshold: int) -> None:
         "for a plagiarism or AI-use decision."
     )
 
+    st.subheader("Extracted text (for verification)")
+    st.caption("Check what was actually extracted and compared for each submission.")
+    for student_name, text in student_texts.items():
+        with st.expander(student_name):
+            st.text(text if text else "(no text extracted)")
+
 
 threshold = st.slider("Similarity alert threshold (%)", min_value=0, max_value=100, value=40)
 

@@ -1,8 +1,11 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 python-docx==1.2.0
+python-pptx==1.0.2
 pypdf==6.18.0
+striprtf==0.0.33
 scikit-learn==1.9.0
+sentence-transformers==6.0.1
 requests==2.34.2
 python-dotenv==1.2.3
 pip_system_certs==5.3

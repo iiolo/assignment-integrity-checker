@@ -65,6 +65,28 @@ def get_access_token() -> str:
     return result["access_token"]
 
 
+def sign_out() -> None:
+    """Forget the cached Microsoft sign-in so the next login starts fresh.
+
+    Writes the cache to disk immediately (rather than relying on the atexit-based save
+    in _load_cache, which only fires when the whole process exits) since the Streamlit
+    server process keeps running across a sign-out.
+    """
+    if not CLIENT_ID or not TENANT_ID or not os.path.exists(TOKEN_CACHE_PATH):
+        return
+
+    cache = msal.SerializableTokenCache()
+    with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as f:
+        cache.deserialize(f.read())
+
+    app = msal.PublicClientApplication(client_id=CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    for account in app.get_accounts():
+        app.remove_account(account)
+
+    with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as f:
+        f.write(cache.serialize())
+
+
 if __name__ == "__main__":
     token = get_access_token()
     print("Login succeeded. Access token acquired (not printed for safety).")

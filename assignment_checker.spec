@@ -7,6 +7,8 @@ datas += collect_data_files("streamlit")
 datas += copy_metadata("streamlit")
 datas += collect_data_files("transformers")
 datas += copy_metadata("transformers")
+datas += collect_data_files("sentence_transformers")
+datas += copy_metadata("sentence_transformers")
 datas += copy_metadata("tqdm")
 datas += copy_metadata("regex")
 datas += copy_metadata("requests")
@@ -17,12 +19,25 @@ datas += copy_metadata("tokenizers")
 datas += copy_metadata("huggingface_hub")
 datas += copy_metadata("safetensors")
 datas += copy_metadata("pyyaml")
+datas += copy_metadata("scikit-learn")
 datas += [("streamlit_app.py", "."), ("src", "src")]
 
 hiddenimports = []
 hiddenimports += collect_submodules("streamlit")
 hiddenimports += collect_submodules("transformers")
-hiddenimports += ["src.extract_text", "src.similarity", "src.ai_detection_check"]
+hiddenimports += collect_submodules("sentence_transformers")
+hiddenimports += [
+    "src.extract_text",
+    "src.similarity",
+    "src.ai_detection_check",
+    "src.teams_auth",
+    "src.teams_client",
+    "msal",
+    "dotenv",
+    "pptx",
+    "striprtf",
+    "striprtf.striprtf",
+]
 
 a = Analysis(
     ["run_app.py"],

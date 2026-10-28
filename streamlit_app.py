@@ -8,7 +8,7 @@ import streamlit as st
 from src.ai_detection_check import check_ai_generated_document, class_median_score, grade_ai_scores
 from src.extract_text import extract_text
 from src.similarity import calculate_similarities, looks_like_prose, strip_shared_lines
-from src.teams_auth import get_access_token, sign_out
+from src.teams_auth import finish_sign_in, get_cached_token, sign_out, start_sign_in
 from src.teams_client import (
     download_resource,
     get_assignments,
@@ -379,15 +379,36 @@ else:
     _t_left, TEAMS_COL, _t_right = st.columns([1, 3, 1])
 
     if "graph_token" not in st.session_state:
+        # Reuse a sign-in from an earlier run so teachers only log in once
+        try:
+            cached_token = get_cached_token()
+        except RuntimeError as exc:
+            cached_token = None
+            with TEAMS_COL:
+                st.error(str(exc))
+        if cached_token:
+            st.session_state.graph_token = cached_token
+            st.rerun()
+
         with TEAMS_COL:
-            st.info(
-                "Signing in will print a login code to the console window behind this browser "
-                "tab. Open https://login.microsoft.com/device and enter that code to continue."
-            )
-            if st.button("Sign in with Microsoft"):
-                with st.spinner("Waiting for sign-in to complete..."):
-                    st.session_state.graph_token = get_access_token()
-                st.rerun()
+            if st.button("Sign in with Microsoft", type="primary"):
+                try:
+                    flow = start_sign_in()
+                except RuntimeError as exc:
+                    st.error(f"Sign-in failed: {exc}")
+                else:
+                    # Show the code right here in the page instead of the console window
+                    st.markdown("**1.** Copy this code (click the copy icon on the right):")
+                    st.code(flow["user_code"], language=None)
+                    st.markdown("**2.** Open the Microsoft page, paste the code, and sign in with your school account:")
+                    st.link_button("Open Microsoft sign-in page", flow["verification_uri"])
+                    with st.spinner("Waiting for you to finish signing in..."):
+                        try:
+                            st.session_state.graph_token = finish_sign_in(flow)
+                        except RuntimeError as exc:
+                            st.error(f"Sign-in failed: {exc}")
+                    if "graph_token" in st.session_state:
+                        st.rerun()
     else:
         token = st.session_state.graph_token
         class_choice = None

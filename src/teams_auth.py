@@ -6,10 +6,12 @@ import atexit
 import msal
 from dotenv import load_dotenv
 
-# Inside the frozen exe, read the .env sitting next to the exe so it works no matter which
-# folder the exe was launched from (shortcut, Start menu, etc.)
+# Inside the frozen exe, a .env sitting next to the exe wins (lets IDs be swapped without a
+# rebuild); otherwise fall back to the .env bundled into the exe. load_dotenv never overrides
+# values already set, so the first file loaded takes priority.
 if getattr(sys, "frozen", False):
     load_dotenv(os.path.join(os.path.dirname(sys.executable), ".env"))
+    load_dotenv(os.path.join(sys._MEIPASS, ".env"))
 else:
     load_dotenv()
 

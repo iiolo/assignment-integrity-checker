@@ -21,6 +21,8 @@ datas += copy_metadata("safetensors")
 datas += copy_metadata("pyyaml")
 datas += copy_metadata("scikit-learn")
 datas += [("streamlit_app.py", "."), ("src", "src")]
+# Bake the Azure app IDs into the exe so teachers only need the single file
+datas += [(".env", ".")]
 
 hiddenimports = []
 hiddenimports += collect_submodules("streamlit")

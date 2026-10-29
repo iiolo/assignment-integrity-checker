@@ -2,15 +2,29 @@
 import html
 import os
 import tempfile
+import time
 
 import streamlit as st
 
-from src.ai_detection_check import check_ai_generated_document, class_median_score, grade_ai_scores
+from src.ai_detection_check import (
+    MIN_WORDS_FOR_SCORE,
+    check_ai_generated_document,
+    class_median_score,
+    count_words,
+    grade_ai_scores,
+)
 from src.extract_text import extract_text
-from src.similarity import calculate_similarities, looks_like_prose, strip_shared_lines
+from src.similarity import (
+    calculate_similarities,
+    find_shared_lines,
+    looks_like_prose,
+    strip_shared_lines,
+    strip_template,
+)
 from src.teams_auth import finish_sign_in, get_cached_token, sign_out, start_sign_in
 from src.teams_client import (
     download_resource,
+    get_assignment_resources,
     get_assignments,
     get_class_members,
     get_my_classes,
@@ -82,17 +96,31 @@ def highlight_text(
                 f'<mark title="{tooltip}" style="background:#ff8a80;color:#000">{escaped_passage}</mark>',
             )
     for passage, score in ai_passages:
-        escaped_passage = html.escape(passage)
-        if escaped_passage:
-            tooltip = html.escape(f"{score:.0f}% AI-like")
-            escaped = escaped.replace(
-                escaped_passage,
-                f'<mark title="{tooltip}" style="background:#ffcc80;color:#000">{escaped_passage}</mark>',
-            )
+        tooltip = html.escape(f"{score:.0f}% AI-like")
+        for line in passage.splitlines():
+            escaped_passage = html.escape(line.strip())
+            if escaped_passage:
+                escaped = escaped.replace(
+                    escaped_passage,
+                    f'<mark title="{tooltip}" style="background:#ffcc80;color:#000">{escaped_passage}</mark>',
+                )
     # Each remaining line is one paragraph's worth of content; giving each its own
     # block with spacing reads far better than one wall of text joined by plain line breaks
     paragraphs = [line for line in escaped.split("\n") if line]
     return "".join(f'<p style="margin:0 0 0.8em 0">{paragraph}</p>' for paragraph in paragraphs)
+
+
+def remove_temp_file(path: str) -> None:
+    """Delete a temp file, tolerating Windows briefly locking a just-written file (antivirus or
+    cloud-sync scanners). A leftover temp file is harmless, so never let it stop a run."""
+    for _ in range(10):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            time.sleep(0.3)
 
 
 def save_upload_to_temp(uploaded_file) -> str:
@@ -103,8 +131,29 @@ def save_upload_to_temp(uploaded_file) -> str:
         return tmp.name
 
 
-def render_report(student_texts: dict[str, str], threshold: int) -> None:
-    """Run similarity + AI detection on the given texts and render a risk-sorted report."""
+def render_report(student_texts: dict[str, str], threshold: int, template_text: str = "") -> None:
+    """Run similarity + AI detection on the given texts and render a risk-sorted report.
+
+    If the teacher's blank template is given, its questions/instructions are removed first so
+    only each student's own answers are compared."""
+    if template_text.strip():
+        with st.spinner("Removing the template from submissions..."):
+            student_texts = strip_template(student_texts, template_text)
+        st.info("Template applied: the questions and instructions from the template were excluded, so only students' own answers are compared.")
+        with st.expander("Check what was excluded as template text"):
+            for line in dict.fromkeys(l.strip() for l in template_text.splitlines() if l.strip()):
+                st.write(f"- {line}")
+    else:
+        shared_lines = sorted(find_shared_lines(student_texts))
+        if shared_lines:
+            st.info(
+                f"No template given: {len(shared_lines)} line(s) found in most submissions were "
+                "treated as shared text (e.g. questions, declarations) and excluded."
+            )
+            with st.expander("Check what was excluded as shared text"):
+                for line in shared_lines:
+                    st.write(f"- {line}")
+
     with st.spinner("Comparing submissions for similarity..."):
         similarity_results = calculate_similarities(student_texts, threshold=threshold)
 
@@ -121,25 +170,34 @@ def render_report(student_texts: dict[str, str], threshold: int) -> None:
     # declaration, etc.) shouldn't count toward a student's own AI-generated score
     texts_for_ai_check = strip_shared_lines(student_texts)
 
+    # Too little text for the detector to say anything (e.g. a student who only submitted the
+    # template): grading it would be noise, and an empty text can even score as "AI"
+    too_short = {name for name in names if count_words(texts_for_ai_check[name]) < MIN_WORDS_FOR_SCORE}
+
     scores: dict[str, float] = {}
-    paragraphs_by_student: dict[str, list[tuple[str, float]]] = {}
+    paragraphs_by_student: dict[str, list[tuple[str, float]]] = {name: [] for name in names}
     progress = st.progress(0.0, text="Running AI detection...")
     for i, student_name in enumerate(names):
-        score, paragraphs = check_ai_generated_document(texts_for_ai_check[student_name])
-        scores[student_name] = score
-        paragraphs_by_student[student_name] = paragraphs
+        if student_name not in too_short:
+            score, paragraphs = check_ai_generated_document(texts_for_ai_check[student_name])
+            scores[student_name] = score
+            paragraphs_by_student[student_name] = paragraphs
         progress.progress((i + 1) / len(names), text=f"Running AI detection... ({i + 1}/{len(names)})")
     progress.empty()
 
     # Graded relative to the class, not by a fixed cutoff alone: see grade_ai_scores()
     grades = grade_ai_scores(scores)
-    ai_data = {name: (scores[name], grades[name], paragraphs_by_student[name]) for name in names}
+    for name in too_short:
+        grades[name] = "Too short"
+    ai_data = {name: (scores.get(name, 0.0), grades[name], paragraphs_by_student[name]) for name in names}
 
     # The raw score alone is misleading (formal writing scores almost as high as real AI
     # text), so the UI leads with how far above the class's own baseline a score sits
     class_median = class_median_score(scores)
 
     def ai_display(name: str) -> str:
+        if name in too_short:
+            return f"not assessed: only {count_words(texts_for_ai_check[name])} words of the student's own text (need {MIN_WORDS_FOR_SCORE}+)"
         score = ai_data[name][0]
         if class_median is None:
             return f"{score:.1f}% (raw score, too few submissions for a class comparison)"
@@ -192,7 +250,10 @@ def render_report(student_texts: dict[str, str], threshold: int) -> None:
         st.caption(
             "AI grade is relative to this class's own scores, not a fixed cutoff: this "
             "detector also scores formal or non-native-English writing almost as high as "
-            "real AI text, so only students who score well above their classmates are flagged."
+            "real AI text, so only students who score well above their classmates are flagged. "
+            "A Low grade does not prove a student wrote everything themselves: text that was "
+            "written by a person and then reworded or polished by AI is the hardest to detect, "
+            "and AI can also be asked to write like a weaker student, errors included."
         )
 
         if not flagged_names:
@@ -233,11 +294,17 @@ def render_report(student_texts: dict[str, str], threshold: int) -> None:
             with st.expander(f"🟢 No issues found ({len(routine_names)})"):
                 for name in routine_names:
                     _, grade, _ = ai_data[name]
-                    st.write(f"{name}: AI {grade} ({ai_display(name)})")
+                    st.write(f"{name}: AI {grade} ({ai_display(name)})" if grade != "Too short" else f"{name}: AI {ai_display(name)}")
 
         st.warning(
             "These results are for reference only and should not be used as the sole basis "
             "for a plagiarism or AI-use decision."
+        )
+        st.info(
+            "**Next step:** talk to the student. Ask them to explain their answers in person and "
+            "show how they worked. Do not replace this report with a hunch that a text \"sounds like "
+            "AI\": in studies, teachers identified AI-written essays at close to chance level while "
+            "feeling confident about their judgement (Fleckenstein et al., 2024)."
         )
 
     with tab_similarity:
@@ -329,8 +396,12 @@ with SETUP_COL:
     )
 
     with st.expander("⚙️ Advanced settings"):
-        threshold = st.slider("Similarity alert threshold (%)", min_value=0, max_value=100, value=40)
-        st.caption("Student pairs at or above this similarity score are flagged. 40% is a reasonable default.")
+        threshold = st.slider("Similarity alert threshold (%)", min_value=0, max_value=100, value=10)
+        st.caption(
+            "Student pairs at or above this score are flagged. The score is the share of the shorter "
+            "submission that is worded the same (5+ words in a row) as the other, or reworded copies. "
+            "Honest answers to the same question usually score under 5%; 10% is a reasonable default."
+        )
 
 st.divider()
 
@@ -345,6 +416,10 @@ if mode == "📤 Upload files":
             "Student assignment files (.docx, .pptx, .pdf, .odt, .hwpx, .rtf, .txt)",
             type=["docx", "pptx", "pdf", "odt", "hwpx", "rtf", "txt"],
             accept_multiple_files=True,
+        )
+        template_file = st.file_uploader(
+            "Optional: blank template / question sheet (its text is excluded so only answers are compared)",
+            type=["docx", "pptx", "pdf", "odt", "hwpx", "rtf", "txt"],
         )
         run_clicked = st.button("Run check", disabled=not uploaded_files)
 
@@ -362,7 +437,7 @@ if mode == "📤 Upload files":
             except (ValueError, FileNotFoundError) as exc:
                 failures.append(f"{uploaded_file.name}: {exc}")
             finally:
-                os.remove(temp_path)
+                remove_temp_file(temp_path)
             progress.progress(
                 (i + 1) / len(uploaded_files), text=f"Extracting text from files... ({i + 1}/{len(uploaded_files)})"
             )
@@ -373,7 +448,17 @@ if mode == "📤 Upload files":
                 for failure in failures:
                     st.write(failure)
 
-        render_report(student_texts, threshold)
+        template_text = ""
+        if template_file is not None:
+            template_path = save_upload_to_temp(template_file)
+            try:
+                template_text = extract_text(template_path)
+            except (ValueError, FileNotFoundError) as exc:
+                st.warning(f"Could not read the template, comparing without it: {exc}")
+            finally:
+                remove_temp_file(template_path)
+
+        render_report(student_texts, threshold, template_text)
 
 else:
     _t_left, TEAMS_COL, _t_right = st.columns([1, 3, 1])
@@ -472,7 +557,7 @@ else:
                                     except (ValueError, FileNotFoundError, RuntimeError) as exc:
                                         st.error(f"Failed to read {resource['displayName']}: {exc}")
                                     finally:
-                                        os.remove(temp_path)
+                                        remove_temp_file(temp_path)
 
                             if not preview_texts:
                                 st.warning("This submission had no readable file attached.")
@@ -522,7 +607,7 @@ else:
                     except (ValueError, FileNotFoundError, RuntimeError) as exc:
                         failures.append(f"{student_name} - {resource['displayName']}: {exc}")
                     finally:
-                        os.remove(temp_path)
+                        remove_temp_file(temp_path)
 
                 if texts:
                     student_texts[student_name] = "\n".join(texts)
@@ -537,4 +622,23 @@ else:
                     for failure in failures:
                         st.write(failure)
 
-            render_report(student_texts, threshold)
+            # Teacher-attached files on the assignment (blank template / questions), if any
+            template_texts = []
+            try:
+                for resource in get_assignment_resources(token, class_choice["id"], assignment_choice["id"]):
+                    suffix = os.path.splitext(resource["displayName"])[1]
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        download_resource(token, resource["fileUrl"], temp_path)
+                        template_texts.append(extract_text(temp_path))
+                    except (ValueError, FileNotFoundError, RuntimeError):
+                        pass
+                    finally:
+                        remove_temp_file(temp_path)
+            except RuntimeError as exc:
+                st.caption(f"Could not read the assignment's template files ({exc}); using shared-text detection instead.")
+            if not template_texts:
+                st.caption("No template file found on this assignment; shared questions are detected automatically instead.")
+
+            render_report(student_texts, threshold, "\n".join(template_texts))

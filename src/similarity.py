@@ -3,8 +3,6 @@ from itertools import combinations
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 # Apache-2.0 licensed (commercial use allowed), small and widely used for sentence similarity
 SEMANTIC_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -24,7 +22,25 @@ EVIDENCE_TOP_N = 3
 
 # Semantic (meaning-based) similarity runs hotter than literal TF-IDF overlap even
 # between unrelated sentences, so it needs a higher floor before being shown as evidence
-MIN_EVIDENCE_SCORE = 55.0
+MIN_EVIDENCE_SCORE = 85.0
+
+# Literal copying is measured with word n-gram "shingles" (Broder 1997) and the containment
+# of the shorter text in the longer one. Same-topic answers share vocabulary but rarely share
+# N words in a row, so unlike unigram TF-IDF this does not score honest answers as copying.
+NGRAM_SIZE = 5
+
+# A shingle found in at least this share of submissions is shared wording (quoted question,
+# stock phrase), not evidence of copying between two particular students
+COMMON_NGRAM_THRESHOLD = 0.4
+
+# Below this many shingles a text is too short for the containment ratio to mean anything
+MIN_SHINGLES = 30
+
+# Runs of shared shingles shorter than this many words aren't shown as copied passages
+MIN_PASSAGE_WORDS = 8
+
+# Paraphrase check needs at least this many sentences in the shorter text to be meaningful
+MIN_SENTENCES_FOR_PARAPHRASE = 5
 
 # Below this share of non-empty lines being real sentences, a submission is probably a
 # table, checklist, or rubric-style form rather than free-written prose (e.g. a trainer's
@@ -58,10 +74,10 @@ def _load_semantic_model() -> SentenceTransformer:
 _semantic_model = _load_semantic_model()
 
 
-def strip_shared_lines(student_texts: dict[str, str]) -> dict[str, str]:
-    """Remove lines that most submissions share verbatim (e.g. assignment instructions or a
-    standard academic-integrity declaration), so downstream analysis only sees each
-    student's own content. Public so both similarity comparison and AI detection can use it."""
+def find_shared_lines(student_texts: dict[str, str]) -> set[str]:
+    """Lines that most submissions share verbatim (assignment instructions, a standard
+    academic-integrity declaration). Public so the report can show the teacher exactly what
+    was excluded: automatic removal can be wrong, so a human should be able to check it."""
     lines_by_student = {
         name: [line.strip() for line in text.splitlines() if line.strip()]
         for name, text in student_texts.items()
@@ -70,7 +86,7 @@ def strip_shared_lines(student_texts: dict[str, str]) -> dict[str, str]:
     # Skip with too few submissions: not enough students to tell a shared template
     # apart from a small group copying each other
     if len(lines_by_student) < 3:
-        return student_texts
+        return set()
 
     line_counts: dict[str, int] = {}
     for lines in lines_by_student.values():
@@ -78,12 +94,74 @@ def strip_shared_lines(student_texts: dict[str, str]) -> dict[str, str]:
             line_counts[line] = line_counts.get(line, 0) + 1
 
     n = len(lines_by_student)
-    common_lines = {line for line, count in line_counts.items() if count / n >= COMMON_LINE_THRESHOLD}
+    return {line for line, count in line_counts.items() if count / n >= COMMON_LINE_THRESHOLD}
+
+
+def strip_shared_lines(student_texts: dict[str, str]) -> dict[str, str]:
+    """Remove lines that most submissions share verbatim, so downstream analysis only sees each
+    student's own content. Public so both similarity comparison and AI detection can use it."""
+    common_lines = find_shared_lines(student_texts)
+    if not common_lines:
+        return student_texts
 
     return {
-        name: "\n".join(line for line in lines if line not in common_lines)
-        for name, lines in lines_by_student.items()
+        name: "\n".join(line for line in (l.strip() for l in text.splitlines()) if line and line not in common_lines)
+        for name, text in student_texts.items()
     }
+
+
+def _normalize_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def strip_template(student_texts: dict[str, str], template_text: str) -> dict[str, str]:
+    """Remove the teacher's blank template (questions, instructions, declarations) from every
+    submission so only the students' own answers are compared.
+
+    Unlike strip_shared_lines(), which has to guess what is shared from the submissions
+    themselves, this knows exactly what the teacher wrote, so it works for any class size
+    and still catches questions a student reworded slightly.
+    """
+    all_lines = [_normalize_line(line) for line in template_text.splitlines()]
+    all_lines = [line for line in all_lines if line]
+    # Short template lines (field labels like "Date" or a unit code) only match whole lines;
+    # as substrings they'd cut words out of real answers
+    exact = set(all_lines)
+    template_lines = [line for line in all_lines if len(line) >= SENTENCE_MIN_LENGTH]
+    if not template_lines:
+        return student_texts
+
+    # Longest first so a long template line is removed before any shorter line inside it
+    contained = sorted(set(template_lines), key=len, reverse=True)
+    template_embeddings = _semantic_model.encode(template_lines, normalize_embeddings=True)
+
+    result = {}
+    for name, text in student_texts.items():
+        lines = [_normalize_line(line) for line in text.splitlines()]
+        lines = [line for line in lines if line]
+
+        # Template wording typed on the same line as the answer ("Q1. Why? Because...")
+        cleaned = []
+        for line in lines:
+            if line in exact:
+                continue
+            for template_line in contained:
+                if template_line in line:
+                    line = line.replace(template_line, " ")
+            line = _normalize_line(line)
+            if line:
+                cleaned.append(line)
+
+        # Reworded copies of a template line (e.g. a question retyped with minor edits)
+        candidates = [i for i, line in enumerate(cleaned) if len(line) >= SENTENCE_MIN_LENGTH]
+        drop = set()
+        if candidates:
+            embeddings = _semantic_model.encode([cleaned[i] for i in candidates], normalize_embeddings=True)
+            best = (embeddings @ template_embeddings.T).max(axis=1)
+            drop = {candidates[k] for k, score in enumerate(best) if score >= COMMON_SENTENCE_SIMILARITY}
+
+        result[name] = "\n".join(line for i, line in enumerate(cleaned) if i not in drop)
+    return result
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -166,42 +244,90 @@ def _remove_common_sentences(
     return result
 
 
-def _semantic_similarity(
+_URL_RE = re.compile(r"https?://\S+|www\.\S+")
+_WORD_RE = re.compile(r"[A-Za-z0-9’']+")
+
+
+def _tokenize(text: str) -> tuple[str, list[tuple[str, int, int]]]:
+    """Lower-cased words with their positions in the URL-stripped text. URLs and reference
+    lists are shared whenever two students cite the same source, so they are ignored."""
+    cleaned = _URL_RE.sub(" ", text)
+    return cleaned, [(m.group().lower(), m.start(), m.end()) for m in _WORD_RE.finditer(cleaned)]
+
+
+def _shingles(tokens: list[tuple[str, int, int]]) -> list[tuple[str, ...]]:
+    words = [t[0] for t in tokens]
+    return [tuple(words[i : i + NGRAM_SIZE]) for i in range(len(words) - NGRAM_SIZE + 1)]
+
+
+def _shared_passages(
+    cleaned_a: str, tokens_a, shingles_a, cleaned_b: str, tokens_b, shingles_b, shared: set
+) -> list[tuple[str, str, float]]:
+    """Merge overlapping shared shingles into the longest runs of identical wording
+    (the seed-extension step used by PAN text-alignment systems), as copied-passage evidence."""
+    first_in_b: dict[tuple[str, ...], int] = {}
+    for j, sh in enumerate(shingles_b):
+        first_in_b.setdefault(sh, j)
+
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(shingles_a):
+        if shingles_a[i] in shared:
+            j = i
+            while j + 1 < len(shingles_a) and shingles_a[j + 1] in shared:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+
+    passages = []
+    for start, end in runs:
+        n_words = end - start + NGRAM_SIZE
+        if n_words < MIN_PASSAGE_WORDS:
+            continue
+        b_start = first_in_b[shingles_a[start]]
+        text_a = cleaned_a[tokens_a[start][1] : tokens_a[end + NGRAM_SIZE - 1][2]]
+        text_b = cleaned_b[tokens_b[b_start][1] : tokens_b[b_start + n_words - 1][2]]
+        passages.append((n_words, text_a, text_b))
+    passages.sort(reverse=True)
+    return [(a, b, 100.0) for _, a, b in passages[:EVIDENCE_TOP_N]]
+
+
+def _paraphrase_similarity(
     sentences_a: list[str], embeddings_a, sentences_b: list[str], embeddings_b
 ) -> tuple[float, list[tuple[str, str, float]]]:
-    """Meaning-based similarity between two already-embedded texts, robust to paraphrasing.
-
-    Returns an overall percentage (how much of each text has a close semantic match in the
-    other) plus the sentence pairs that matched most closely, as evidence.
-    """
+    """Share of the shorter text's sentences that have a near-identical-meaning sentence in
+    the other text (catches reworded copying that word matching misses), plus those pairs."""
     if embeddings_a is None or embeddings_b is None:
+        return 0.0, []
+    if min(len(sentences_a), len(sentences_b)) < MIN_SENTENCES_FOR_PARAPHRASE:
         return 0.0, []
 
     # Embeddings are normalized, so the dot product is the cosine similarity
     sim_matrix = embeddings_a @ embeddings_b.T
-
-    best_for_a = sim_matrix.max(axis=1)
-    best_for_b = sim_matrix.max(axis=0)
-    overall_score = float((best_for_a.mean() + best_for_b.mean()) / 2 * 100)
+    axis = 1 if len(sentences_a) <= len(sentences_b) else 0
+    best = sim_matrix.max(axis=axis)
+    score = float((best * 100 >= MIN_EVIDENCE_SCORE).mean() * 100)
 
     matches = [
         (sentences_a[i], sentences_b[j], float(sim_matrix[i][j] * 100))
         for i, j in enumerate(sim_matrix.argmax(axis=1))
+        if sim_matrix[i][j] * 100 >= MIN_EVIDENCE_SCORE
     ]
-    matches = [match for match in matches if match[2] >= MIN_EVIDENCE_SCORE]
     matches.sort(key=lambda match: match[2], reverse=True)
-    return overall_score, matches[:EVIDENCE_TOP_N]
+    return score, matches[:EVIDENCE_TOP_N]
 
 
 def calculate_similarities(
-    student_texts: dict[str, str], threshold: float = 40.0
+    student_texts: dict[str, str], threshold: float = 10.0
 ) -> list[tuple[str, str, float, list[tuple[str, str, float]]]]:
-    """Compare every pair of students' texts and return pairs with similarity >= threshold(%),
-    each with its strongest matching sentences as evidence.
+    """Compare every pair of students' texts and return pairs scoring >= threshold(%),
+    each with its strongest matching passages as evidence.
 
-    The reported score is the higher of two measures: literal TF-IDF overlap (catches
-    copy-pasted text) and semantic sentence similarity (catches paraphrased copying that
-    TF-IDF would miss), so a pair is flagged if either method finds a strong match.
+    The score is the higher of two measures: containment of word 5-grams (how much of the
+    shorter text is wording also found in the other: copy-paste) and the share of sentences
+    that are reworded copies (paraphrase). Wording shared by many students is ignored.
     """
     students = list(student_texts.keys())
 
@@ -209,31 +335,48 @@ def calculate_similarities(
     if len(students) < 2:
         return []
 
-    # Vectorize all students' (line-stripped) texts using TF-IDF
-    stripped_texts = strip_shared_lines(student_texts)
-    texts = [stripped_texts[name] for name in students]
-    vectorizer = TfidfVectorizer()
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    tfidf_sim = cosine_similarity(tfidf_matrix)
+    tokenized = {name: _tokenize(student_texts[name]) for name in students}
+    shingles = {name: _shingles(tokenized[name][1]) for name in students}
+    shingle_sets = {name: set(sh) for name, sh in shingles.items()}
 
-    # Built from the original text, not the line-stripped version: stripping lines
-    # first would remove a shared sentence for whichever students had it on a line by
-    # itself, leaving only a minority remnant and understating how widely it's shared
+    common: set = set()
+    if len(students) >= 3:
+        counts: dict[tuple[str, ...], int] = {}
+        for sh_set in shingle_sets.values():
+            for sh in sh_set:
+                counts[sh] = counts.get(sh, 0) + 1
+        # At least 3 students: in a small class 40% is only 2, which is exactly what two
+        # students copying from each other look like, and would erase the copied passage
+        min_students = max(3, COMMON_NGRAM_THRESHOLD * len(students))
+        common = {sh for sh, c in counts.items() if c >= min_students}
+
     sentence_data = _remove_common_sentences(_embed_students(student_texts))
 
     results: list[tuple[str, str, float, list[tuple[str, str, float]]]] = []
 
-    # Iterate over every unique student pair (A-B) and keep only pairs at or above the threshold
     for i, j in combinations(range(len(students)), 2):
         name_a, name_b = students[i], students[j]
-        literal_score = tfidf_sim[i][j] * 100
+        set_a, set_b = shingle_sets[name_a] - common, shingle_sets[name_b] - common
+
+        literal_score = 0.0
+        passages: list[tuple[str, str, float]] = []
+        if min(len(set_a), len(set_b)) >= MIN_SHINGLES:
+            shared = set_a & set_b
+            literal_score = len(shared) / min(len(set_a), len(set_b)) * 100
+            if shared:
+                passages = _shared_passages(
+                    tokenized[name_a][0], tokenized[name_a][1], shingles[name_a],
+                    tokenized[name_b][0], tokenized[name_b][1], shingles[name_b], shared,
+                )
 
         sentences_a, embeddings_a = sentence_data[name_a]
         sentences_b, embeddings_b = sentence_data[name_b]
-        semantic_score, evidence = _semantic_similarity(sentences_a, embeddings_a, sentences_b, embeddings_b)
+        paraphrase_score, paraphrase_evidence = _paraphrase_similarity(
+            sentences_a, embeddings_a, sentences_b, embeddings_b
+        )
 
-        score = max(literal_score, semantic_score)
+        score = max(literal_score, paraphrase_score)
         if score >= threshold:
-            results.append((name_a, name_b, score, evidence))
+            results.append((name_a, name_b, score, passages if literal_score >= paraphrase_score else paraphrase_evidence))
 
     return results

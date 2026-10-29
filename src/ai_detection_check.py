@@ -3,8 +3,17 @@ from transformers import pipeline
 # Apache-2.0 licensed (commercial use allowed), maintained by Fakespot (Mozilla)
 MODEL_NAME = "fakespot-ai/roberta-base-ai-text-detection-v1"
 
-# Paragraphs shorter than this give the classifier too little context for a reliable score
-PARAGRAPH_MIN_LENGTH = 40
+# Detectors need real context: the literature finds statistical and fine-tuned detectors need
+# roughly 100-200 words to reach their potential, and accuracy drops sharply on sentence-length
+# input (Fraser, Dawkins & Kiritchenko, JAIR 2025). Short paragraphs are therefore merged
+# (consecutive ones, same student) into chunks of about this many words before scoring.
+CHUNK_TARGET_WORDS = 150
+
+# A trailing chunk shorter than this is folded into the previous one instead of scored alone
+CHUNK_MIN_WORDS = 60
+
+# A submission with fewer words than this is not graded at all: any score would be noise
+MIN_WORDS_FOR_SCORE = 100
 
 # Below this many submissions, comparing a student against classmates isn't meaningful
 MIN_CLASS_SIZE_FOR_RELATIVE_GRADING = 3
@@ -49,23 +58,52 @@ def check_ai_generated(text: str) -> float:
     return ai_score * 100
 
 
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def _chunk_paragraphs(text: str) -> list[str]:
+    """Merge consecutive paragraphs into chunks of about CHUNK_TARGET_WORDS words, so the
+    classifier always sees enough context (short answers scored one by one are unreliable,
+    while concatenating a student's short passages is known to improve detection)."""
+    paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    words = 0
+    for paragraph in paragraphs:
+        current.append(paragraph)
+        words += count_words(paragraph)
+        if words >= CHUNK_TARGET_WORDS:
+            chunks.append(current)
+            current, words = [], 0
+    if current:
+        if chunks and words < CHUNK_MIN_WORDS:
+            chunks[-1].extend(current)
+        else:
+            chunks.append(current)
+    return ["\n".join(chunk) for chunk in chunks]
+
+
 def check_ai_generated_document(text: str, top_n: int = 3) -> tuple[float, list[tuple[str, float]]]:
     """Score a whole submission for AI-generated likelihood.
 
-    Scoring is done per paragraph rather than running the classifier once on the full
-    text (the model truncates input at 512 tokens, so a single full-text pass would
-    silently ignore anything after the first paragraph or two of a long submission),
-    and the document score is the average across all of that student's paragraphs.
+    Scoring is done per chunk of about CHUNK_TARGET_WORDS words rather than running the
+    classifier once on the full text (the model truncates input at 512 tokens, so a single
+    full-text pass would silently ignore anything after the first part of a long submission),
+    and the document score is the average across that student's chunks.
 
-    Returns the document-level score plus the top_n most AI-like paragraphs, so the
-    report can show exactly which passages scored highest even though they're averaged
-    into the overall score.
+    Callers should skip submissions under MIN_WORDS_FOR_SCORE words (see count_words): the
+    score of a very short text is not reliable.
+
+    Returns the document-level score plus the top_n most AI-like chunks, so the report can
+    show exactly which passages scored highest even though they're averaged into the overall
+    score.
     """
-    paragraphs = [p.strip() for p in text.split("\n") if len(p.strip()) >= PARAGRAPH_MIN_LENGTH]
-    if not paragraphs:
+    chunks = _chunk_paragraphs(text)
+    if not chunks:
         return check_ai_generated(text), []
 
-    scored = [(paragraph, check_ai_generated(paragraph)) for paragraph in paragraphs]
+    scored = [(chunk, check_ai_generated(chunk)) for chunk in chunks]
     average_score = sum(score for _, score in scored) / len(scored)
     scored.sort(key=lambda item: item[1], reverse=True)
     return average_score, scored[:top_n]

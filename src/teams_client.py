@@ -75,6 +75,22 @@ def get_submission_resources(
     return resources
 
 
+def get_assignment_resources(token: str, class_id: str, assignment_id: str) -> list[dict]:
+    """Return downloadable files the teacher attached to the assignment itself (e.g. the blank
+    template or question sheet); link-only resources are skipped."""
+    data = _get(
+        f"{GRAPH_BASE}/education/classes/{class_id}/assignments/{assignment_id}/resources",
+        token,
+    )
+    resources = []
+    for r in data.get("value", []):
+        resource = r.get("resource", {})
+        file_url = resource.get("fileUrl")
+        if file_url:
+            resources.append({"displayName": resource.get("displayName"), "fileUrl": file_url})
+    return resources
+
+
 def download_resource(token: str, file_url: str, save_path: str) -> str:
     """Download a submission resource's file content and save it to save_path."""
     response = requests.get(f"{file_url}/content", headers={"Authorization": f"Bearer {token}"})
